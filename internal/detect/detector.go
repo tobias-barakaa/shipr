@@ -1,112 +1,160 @@
+// Package detect discovers applications inside a file tree.
 package detect
 
 import (
+	"fmt"
 	"path"
-	"regexp"
-	"strconv"
+	"sort"
+	"strings"
 
-	"deployer/internal/app"
+	"shipr/internal/app"
 )
 
-const (
-	sourceDefault = "framework default"
-	sourceScript  = "package.json script"
-)
-
-// FS is the minimal file-tree view detectors need.
-// archive.Archive satisfies it; tests can use a fake.
+// FS is the minimal read-only file tree detectors need.
+// archive.Archive satisfies it.
 type FS interface {
 	Has(path string) bool
-	IsDir(path string) bool
 	Read(path string) ([]byte, error)
 	Children(dir string) []string
+	Dirs() []string
 }
 
 // Detector recognises one kind of application in one directory.
+//
+// Detect returns (nil, nil) when dir is not an application of this kind.
+// A non-nil error means a file could not be read or parsed; it is reported
+// as a warning and never aborts the scan. A detector may return both an
+// application and an error.
+//
+// Detectors must set Runtime, Confidence and Evidence, and may add default
+// port candidates. Cross-cutting facts (Dockerfile, .env ports) are added
+// afterwards by enrich, not by detectors.
 type Detector interface {
 	Name() string
-	Detect(fsys FS, dir string) (*app.Application, bool)
+	Detect(fsys FS, dir string) (*app.Application, error)
 }
 
-// Default returns detectors in priority order: the first match per directory wins.
+// Default returns detectors in priority order. When several detectors match
+// the same directory, the highest confidence wins and ties go to the earlier
+// detector. Docker is last: it only wins when nothing else is known.
 func Default() []Detector {
 	return []Detector{
 		Go{},
 		Python{},
 		Node{},
-		Docker{}, // fallback: a Dockerfile with no recognised runtime
+		Docker{},
 	}
 }
 
-// Scan runs detectors over every directory and returns all apps found.
-func Scan(fsys FS, dirs []string, detectors []Detector) []app.Application {
-	var found []app.Application
+// Result is the outcome of scanning a file tree.
+type Result struct {
+	Apps     []app.Application
+	Warnings []string
+}
 
-	for _, dir := range dirs {
-		for _, d := range detectors {
-			a, ok := d.Detect(fsys, dir)
-			if !ok {
-				continue
-			}
-			a.Root = dir
-			a.HasDockerfile = fsys.Has(join(dir, "Dockerfile"))
-			if a.HasDockerfile && a.Runtime != app.RuntimeDocker {
-				a.Markers = append(a.Markers, "Dockerfile")
-			}
-			refinePort(fsys, a)
-			found = append(found, *a)
-			break // one app per directory
+// Directories whose manifests are usually samples, not the real application.
+// They are only scanned when nothing else is found.
+var auxiliaryDirs = map[string]bool{
+	"docs": true, "doc": true,
+	"examples": true, "example": true,
+	"samples": true, "sample": true,
+	"test": true, "tests": true, "testdata": true,
+	"fixtures": true, "fixture": true,
+	"__tests__": true, "__fixtures__": true,
+	"e2e": true, "benchmarks": true,
+}
+
+// Scan finds every application in fsys. Output order is deterministic.
+func Scan(fsys FS, detectors []Detector) Result {
+	dirs := append([]string(nil), fsys.Dirs()...)
+	sort.Strings(dirs)
+
+	var regular, auxiliary []string
+	for _, d := range dirs {
+		if isAuxiliary(d) {
+			auxiliary = append(auxiliary, d)
+		} else {
+			regular = append(regular, d)
 		}
 	}
-	return found
+
+	var res Result
+	res.Apps = scanDirs(fsys, regular, detectors, &res.Warnings)
+	if len(res.Apps) == 0 {
+		res.Apps = scanDirs(fsys, auxiliary, detectors, &res.Warnings)
+	}
+	return res
 }
 
-// ---- shared helpers ----
+func scanDirs(fsys FS, dirs []string, detectors []Detector, warnings *[]string) []app.Application {
+	var apps []app.Application
+	for _, dir := range dirs {
+		if a := detectDir(fsys, dir, detectors, warnings); a != nil {
+			apps = append(apps, *a)
+		}
+	}
+	return apps
+}
+
+func detectDir(fsys FS, dir string, detectors []Detector, warnings *[]string) *app.Application {
+	var candidates []*app.Application
+	for _, d := range detectors {
+		a, err := d.Detect(fsys, dir)
+		if err != nil {
+			*warnings = append(*warnings, fmt.Sprintf("%s: %s detector: %v", displayDir(dir), d.Name(), err))
+		}
+		if a != nil {
+			candidates = append(candidates, a)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// Highest confidence wins; strict ">" keeps detector order on ties.
+	best := candidates[0]
+	for _, c := range candidates[1:] {
+		if c.Confidence > best.Confidence {
+			best = c
+		}
+	}
+	for _, c := range candidates {
+		if c != best && c.Runtime != app.RuntimeDocker {
+			best.AddEvidence(app.EvidenceNote, "also resembles "+string(c.Runtime))
+		}
+	}
+
+	best.Root = dir
+	enrich(fsys, best, warnings)
+	return best
+}
+
+// enrich adds facts that apply to any application, whatever its runtime.
+func enrich(fsys FS, a *app.Application, warnings *[]string) {
+	if fsys.Has(join(a.Root, "Dockerfile")) {
+		a.HasDockerfile = true
+		a.AddEvidence(app.EvidenceFile, "Dockerfile")
+		addPortFrom(fsys, a, "Dockerfile", exposeRe, app.PortDockerfile, warnings)
+	}
+	addPortFrom(fsys, a, ".env", envPortRe, app.PortEnv, warnings)
+	addPortFrom(fsys, a, ".env.example", envPortRe, app.PortEnvExample, warnings)
+	a.NormalizePorts()
+}
+
+func isAuxiliary(dir string) bool {
+	for _, seg := range strings.Split(dir, "/") {
+		if auxiliaryDirs[strings.ToLower(seg)] {
+			return true
+		}
+	}
+	return false
+}
 
 func join(dir, name string) string { return path.Join(dir, name) }
 
-var (
-	exposeRe     = regexp.MustCompile(`(?im)^\s*EXPOSE\s+(\d{2,5})`)
-	envPortRe    = regexp.MustCompile(`(?m)^\s*PORT\s*=\s*["']?(\d{2,5})`)
-	scriptPortRe = regexp.MustCompile(`(?:^|\s)(?:--port|-p|PORT=)[ =]?(\d{2,5})`)
-)
-
-// refinePort upgrades a guessed port using stronger evidence from the project.
-func refinePort(fsys FS, a *app.Application) {
-	if p := portFromFile(fsys, join(a.Root, "Dockerfile"), exposeRe); p != 0 {
-		a.Port, a.PortSource = p, "Dockerfile EXPOSE"
-		return
+func displayDir(dir string) string {
+	if dir == "" {
+		return "/"
 	}
-	if a.PortSource == sourceScript {
-		return
-	}
-	for _, env := range []string{".env", ".env.example"} {
-		if p := portFromFile(fsys, join(a.Root, env), envPortRe); p != 0 {
-			a.Port, a.PortSource = p, env+" PORT"
-			return
-		}
-	}
-}
-
-func portFromFile(fsys FS, p string, re *regexp.Regexp) int {
-	if !fsys.Has(p) {
-		return 0
-	}
-	data, err := fsys.Read(p)
-	if err != nil {
-		return 0
-	}
-	return firstPort(re, string(data))
-}
-
-func firstPort(re *regexp.Regexp, text string) int {
-	m := re.FindStringSubmatch(text)
-	if m == nil {
-		return 0
-	}
-	n, err := strconv.Atoi(m[1])
-	if err != nil || n < 1 || n > 65535 {
-		return 0
-	}
-	return n
+	return "/" + dir
 }
