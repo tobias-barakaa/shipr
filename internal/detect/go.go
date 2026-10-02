@@ -1,10 +1,11 @@
 package detect
 
 import (
+	"fmt"
 	"path"
 	"strings"
 
-	"deployer/internal/app"
+	"shipr/internal/app"
 )
 
 type Go struct{}
@@ -18,46 +19,71 @@ var goFrameworks = []struct{ module, name string }{
 	{"github.com/go-chi/chi", "Chi"},
 }
 
-func (Go) Detect(fsys FS, dir string) (*app.Application, bool) {
-	modFile := join(dir, "go.mod")
-	if !fsys.Has(modFile) {
-		return nil, false
+type goMain struct {
+	target string // go build target, e.g. "." or "./cmd/server"
+	file   string // path relative to the module root
+}
+
+func (Go) Detect(fsys FS, dir string) (*app.Application, error) {
+	modPath := join(dir, "go.mod")
+	if !fsys.Has(modPath) {
+		return nil, nil
 	}
-	data, err := fsys.Read(modFile)
+	// A module without a main package is a library, not an application.
+	mains := goMainPackages(fsys, dir)
+	if len(mains) == 0 {
+		return nil, nil
+	}
+	data, err := fsys.Read(modPath)
 	if err != nil {
-		return nil, false
+		return nil, err
 	}
 	text := string(data)
 
 	a := &app.Application{
-		Name:       goModuleName(text),
-		Runtime:    app.RuntimeGo,
-		Role:       app.RoleBackend,
-		Port:       8080,
-		PortSource: sourceDefault,
-		Markers:    []string{"go.mod"},
+		Name:           goModuleName(text),
+		Runtime:        app.RuntimeGo,
+		Role:           app.RoleBackend,
+		PackageManager: app.PMGo,
+		Confidence:     app.ConfidenceHigh,
 	}
+	a.AddEvidence(app.EvidenceFile, "go.mod")
 	if fsys.Has(join(dir, "go.sum")) {
-		a.Markers = append(a.Markers, "go.sum")
+		a.AddEvidence(app.EvidenceFile, "go.sum")
 	}
 
+	primary := mains[0]
+	a.AddEvidence(app.EvidenceFile, primary.file)
+	if len(mains) > 1 {
+		a.AddEvidence(app.EvidenceNote, fmt.Sprintf("%d main packages found; using %s", len(mains), primary.target))
+	}
 	for _, fw := range goFrameworks {
 		if strings.Contains(text, fw.module) {
 			a.Framework = fw.name
+			a.AddEvidence(app.EvidenceDependency, fw.name)
 			break
 		}
 	}
 
-	target := goMainTarget(fsys, dir)
-	if target == "" {
-		// No main package: probably a library, so no port or start command.
-		a.BuildCmd = "go build ./..."
-		a.Port, a.PortSource = 0, ""
-	} else {
-		a.BuildCmd = "go build -o app " + target
-		a.StartCmd = "./app"
+	// Go has no manifest-declared commands, so these are inferred conventions.
+	a.BuildCmd = "go build -o app " + primary.target
+	a.StartCmd = "./app"
+	a.AddPort(8080, app.PortConvention)
+	return a, nil
+}
+
+func goMainPackages(fsys FS, dir string) []goMain {
+	var out []goMain
+	if fsys.Has(join(dir, "main.go")) {
+		out = append(out, goMain{target: ".", file: "main.go"})
 	}
-	return a, true
+	for _, c := range fsys.Children(join(dir, "cmd")) {
+		f := path.Join("cmd", c, "main.go")
+		if fsys.Has(join(dir, f)) {
+			out = append(out, goMain{target: "./cmd/" + c, file: f})
+		}
+	}
+	return out
 }
 
 func goModuleName(text string) string {
@@ -65,21 +91,10 @@ func goModuleName(text string) string {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "module ") {
 			mod := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "module ")), `"`)
+			if mod == "" {
+				return ""
+			}
 			return path.Base(mod)
-		}
-	}
-	return ""
-}
-
-// goMainTarget finds where the main package lives: "." or "./cmd/<name>".
-func goMainTarget(fsys FS, dir string) string {
-	if fsys.Has(join(dir, "main.go")) {
-		return "."
-	}
-	cmdDir := join(dir, "cmd")
-	for _, child := range fsys.Children(cmdDir) {
-		if fsys.IsDir(join(cmdDir, child)) {
-			return "./cmd/" + child
 		}
 	}
 	return ""

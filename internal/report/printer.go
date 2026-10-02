@@ -1,13 +1,14 @@
+// Package report renders a Project for humans. It never touches the archive.
 package report
 
 import (
 	"fmt"
 	"io"
 	"sort"
-	"strconv"
 	"strings"
+	"unicode"
 
-	"deployer/internal/app"
+	"shipr/internal/app"
 )
 
 type Printer struct {
@@ -17,101 +18,114 @@ type Printer struct {
 func NewPrinter(w io.Writer) *Printer { return &Printer{w: w} }
 
 func (p *Printer) Print(proj *app.Project) {
-	fmt.Fprintf(p.w, "Project: %s\n", proj.Name)
-
+	p.linef("Project: %s", clean(proj.Name))
 	if len(proj.Apps) == 0 {
-		fmt.Fprintln(p.w, "\nNo deployable application detected.")
-		return
+		p.linef("No applications detected.")
+	} else {
+		p.linef("Applications found: %d", len(proj.Apps))
+		for i := range proj.Apps {
+			p.printApp(i+1, proj.Apps[i])
+		}
 	}
 
-	fmt.Fprintf(p.w, "Applications found: %d (%s)\n", len(proj.Apps), describeLayout(proj.Apps))
-
-	for i, a := range proj.Apps {
-		p.printApp(i+1, a)
-	}
-
-	if conflicts := portConflicts(proj.Apps); len(conflicts) > 0 {
-		fmt.Fprintln(p.w, "\nWarnings")
-		fmt.Fprintln(p.w, "────────")
-		for _, c := range conflicts {
-			fmt.Fprintf(p.w, "  ! %s\n", c)
+	warnings := append([]string(nil), proj.Warnings...)
+	warnings = append(warnings, portClashes(proj.Apps)...)
+	if len(warnings) > 0 {
+		p.linef("")
+		p.linef("Warnings:")
+		for _, w := range warnings {
+			p.linef("  ! %s", clean(w))
 		}
 	}
 }
 
 func (p *Printer) printApp(n int, a app.Application) {
-	title := fmt.Sprintf("[%d] %s", n, a.Name)
-	fmt.Fprintf(p.w, "\n%s\n%s\n", title, strings.Repeat("─", len([]rune(title))))
+	p.linef("")
+	p.linef("[%d] %s", n, clean(a.Name))
+	p.linef("")
 
 	p.row("Location", a.Location())
 	p.row("Runtime", string(a.Runtime))
 	p.row("Framework", a.Framework)
 	p.row("Role", string(a.Role))
-	p.row("Port", portText(a))
-	p.row("Build", a.BuildCmd)
-	p.row("Start", a.StartCmd)
-	p.row("Deploy", a.DeployMethod())
+	p.row("Confidence", a.Confidence.String())
+	p.row("Package", string(a.PackageManager))
 
-	if len(a.Markers) > 0 {
-		fmt.Fprintln(p.w, "Detected:")
-		for _, m := range a.Markers {
-			fmt.Fprintf(p.w, "  ✓ %s\n", m)
+	if sel, ok := a.Port(); ok {
+		text := fmt.Sprintf("%d (%s)", sel.Number, sel.Source)
+		if sel.Source.IsDefault() {
+			text = fmt.Sprintf("%d (%s, unconfirmed)", sel.Number, sel.Source)
+		}
+		p.row("Port", text)
+		if conflicts := a.PortConflicts(); len(conflicts) > 0 {
+			p.row("Also found", joinPorts(conflicts))
 		}
 	}
+	p.row("Build", a.BuildCmd)
+	p.row("Start", a.StartCmd)
+
+	if len(a.Evidence) > 0 {
+		p.linef("")
+		p.linef("Evidence:")
+		for _, e := range a.Evidence {
+			mark := "✓"
+			if e.Kind == app.EvidenceNote {
+				mark = "~"
+			}
+			p.linef("  %s %s", mark, clean(e.String()))
+		}
+	}
+}
+
+func (p *Printer) linef(format string, args ...any) {
+	fmt.Fprintf(p.w, format+"\n", args...)
 }
 
 func (p *Printer) row(label, value string) {
 	if value == "" {
 		return
 	}
-	fmt.Fprintf(p.w, "%-10s %s\n", label+":", value)
+	fmt.Fprintf(p.w, "%-12s%s\n", label+":", clean(value))
 }
 
-func portText(a app.Application) string {
-	if a.Port == 0 {
-		return ""
+func joinPorts(cs []app.PortCandidate) string {
+	parts := make([]string, len(cs))
+	for i, c := range cs {
+		parts[i] = fmt.Sprintf("%d (%s)", c.Number, c.Source)
 	}
-	if a.PortSource == "" {
-		return strconv.Itoa(a.Port)
-	}
-	return fmt.Sprintf("%d (%s)", a.Port, a.PortSource)
+	return strings.Join(parts, ", ")
 }
 
-func describeLayout(apps []app.Application) string {
-	if len(apps) == 1 {
-		return "single application"
-	}
-	var frontend, backend bool
-	for _, a := range apps {
-		switch a.Role {
-		case app.RoleFrontend:
-			frontend = true
-		case app.RoleBackend:
-			backend = true
-		case app.RoleFullstack:
-			frontend, backend = true, true
-		}
-	}
-	if frontend && backend {
-		return "multi-app: frontend + backend"
-	}
-	return "multi-app"
-}
-
-func portConflicts(apps []app.Application) []string {
+// portClashes reports applications whose selected ports collide.
+func portClashes(apps []app.Application) []string {
 	byPort := map[int][]string{}
 	for _, a := range apps {
-		if a.Port != 0 {
-			byPort[a.Port] = append(byPort[a.Port], a.Name)
+		if sel, ok := a.Port(); ok {
+			byPort[sel.Number] = append(byPort[sel.Number], a.Name)
 		}
 	}
+	var ports []int
+	for n, names := range byPort {
+		if len(names) > 1 {
+			ports = append(ports, n)
+		}
+	}
+	sort.Ints(ports)
 
 	var out []string
-	for port, names := range byPort {
-		if len(names) > 1 {
-			out = append(out, fmt.Sprintf("port %d is used by %s", port, strings.Join(names, ", ")))
-		}
+	for _, n := range ports {
+		out = append(out, fmt.Sprintf("port %d is used by %s", n, strings.Join(byPort[n], ", ")))
 	}
-	sort.Strings(out)
 	return out
+}
+
+// clean replaces control characters so archive-supplied text (package names,
+// file names) cannot inject terminal escape sequences.
+func clean(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return '?'
+		}
+		return r
+	}, s)
 }

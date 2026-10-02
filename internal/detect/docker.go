@@ -1,20 +1,22 @@
 package detect
 
-import "deployer/internal/app"
+import "shipr/internal/app"
 
-// Docker is the fallback for directories with a Dockerfile but no
-// recognised language. It must stay last in Default().
+// Docker identifies a directory by its Dockerfile alone. It has low
+// confidence, so any real runtime detector for the same directory wins.
 type Docker struct{}
 
 func (Docker) Name() string { return "docker" }
 
-func (Docker) Detect(fsys FS, dir string) (*app.Application, bool) {
+func (Docker) Detect(fsys FS, dir string) (*app.Application, error) {
 	if !fsys.Has(join(dir, "Dockerfile")) {
-		return nil, false
+		return nil, nil
 	}
-	return &app.Application{
-		Runtime: app.RuntimeDocker,
-		Role:    app.RoleUnknown,
-		Markers: []string{"Dockerfile"},
-	}, true
+	a := &app.Application{
+		Runtime:    app.RuntimeDocker,
+		Role:       app.RoleUnknown,
+		Confidence: app.ConfidenceLow,
+	}
+	a.AddEvidence(app.EvidenceFile, "Dockerfile")
+	return a, nil
 }

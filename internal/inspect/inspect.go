@@ -1,3 +1,4 @@
+// Package inspect orchestrates Phase 1: archive in, Project out.
 package inspect
 
 import (
@@ -6,22 +7,27 @@ import (
 	"path/filepath"
 	"strings"
 
-	"deployer/internal/app"
-	"deployer/internal/archive"
-	"deployer/internal/detect"
+	"shipr/internal/app"
+	"shipr/internal/archive"
+	"shipr/internal/detect"
 )
 
-// Run opens a zip and returns everything deployable found inside it.
+var _ detect.FS = (*archive.Archive)(nil)
+
+// Run inspects a zip file and returns everything discovered inside it.
 func Run(zipPath string) (*app.Project, error) {
 	arc, err := archive.Open(zipPath)
 	if err != nil {
-		return nil, fmt.Errorf("opening %s: %w", zipPath, err)
+		return nil, fmt.Errorf("opening archive %q: %w", zipPath, err)
 	}
 	defer arc.Close()
 
-	project := &app.Project{Name: projectName(zipPath)}
-	project.Apps = detect.Scan(arc, arc.Dirs(), detect.Default())
-
+	res := detect.Scan(arc, detect.Default())
+	project := &app.Project{
+		Name:     projectName(zipPath),
+		Apps:     res.Apps,
+		Warnings: append(arc.Warnings(), res.Warnings...),
+	}
 	for i := range project.Apps {
 		a := &project.Apps[i]
 		if a.Name == "" {
