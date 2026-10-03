@@ -232,7 +232,7 @@ func TestWeakMarkersAreNotApplications(t *testing.T) {
 	cases := map[string]map[string]string{
 		"devDependencies only": {"package.json": `{"devDependencies":{"prettier":"3"}}`},
 		"empty package.json":   {"package.json": `{}`},
-		"workspace root": {"package.json": `{"workspaces":["packages/*"],"scripts":{"build":"turbo build"}}`},
+		"workspace root":       {"package.json": `{"workspaces":["packages/*"],"scripts":{"build":"turbo build"}}`},
 		"go library":           {"go.mod": "module x\n", "lib.go": "package x\n"},
 		"flask-cors only":      {"requirements.txt": "flask-cors\n"},
 		"bare requirements":    {"requirements.txt": "requests\n"},
@@ -256,8 +256,8 @@ func TestMalformedManifestBecomesWarning(t *testing.T) {
 
 func TestAuxiliaryDirectoriesIgnoredWhenRealAppExists(t *testing.T) {
 	res := scan(t, map[string]string{
-		"package.json":                  astroPkg,
-		"examples/demo/package.json":    expressPkg,
+		"package.json":                    astroPkg,
+		"examples/demo/package.json":      expressPkg,
 		"tests/fixtures/requirements.txt": "flask\n",
 	})
 	if got, want := roots(res), []string{""}; !reflect.DeepEqual(got, want) {

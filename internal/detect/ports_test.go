@@ -43,12 +43,12 @@ func TestPortPrecedence(t *testing.T) {
 func TestInvalidPortsAreIgnored(t *testing.T) {
 	badScript := `{"scripts":{"dev":"astro dev --port 99999"},"dependencies":{"astro":"4"}}`
 	cases := map[string]map[string]string{
-		"env too large":     {"package.json": astroPkg, ".env": "PORT=99999\n"},
-		"env zero":          {"package.json": astroPkg, ".env": "PORT=0\n"},
-		"env not a number":  {"package.json": astroPkg, ".env": "PORT=abc\n"},
-		"dockerfile large":  {"package.json": astroPkg, "Dockerfile": "EXPOSE 70000\n"},
-		"dockerfile huge":   {"package.json": astroPkg, "Dockerfile": "EXPOSE 123456789012345678901\n"},
-		"script too large":  {"package.json": badScript},
+		"env too large":    {"package.json": astroPkg, ".env": "PORT=99999\n"},
+		"env zero":         {"package.json": astroPkg, ".env": "PORT=0\n"},
+		"env not a number": {"package.json": astroPkg, ".env": "PORT=abc\n"},
+		"dockerfile large": {"package.json": astroPkg, "Dockerfile": "EXPOSE 70000\n"},
+		"dockerfile huge":  {"package.json": astroPkg, "Dockerfile": "EXPOSE 123456789012345678901\n"},
+		"script too large": {"package.json": badScript},
 	}
 	for name, files := range cases {
 		t.Run(name, func(t *testing.T) {
